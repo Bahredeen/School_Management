@@ -2,22 +2,28 @@ import { useEffect, useMemo, useState } from 'react';
 import {
   Bell,
   BookOpen,
+  Building2,
   CalendarDays,
   CheckCircle2,
   CircleDollarSign,
-  ClipboardCheck,
+  Clock,
   GraduationCap,
-  MessageSquare,
+  Image as ImageIcon,
+  PhoneCall,
   Printer,
+  Receipt,
   Send,
   ShieldCheck,
   Sparkles,
+  Upload,
   UserCheck,
   Users,
   X,
+  XCircle,
 } from 'lucide-react';
 import {
   isSupabaseConfigured,
+  PAYMENT_PROVIDERS,
   supabase,
   type Announcement,
   type AttendanceRecord,
@@ -25,7 +31,10 @@ import {
   type GradeRecord,
   type MessageRecord,
   type ParentFeedback,
+  type PaymentProvider,
+  type PaymentReceipt,
   type Profile,
+  type SmsLog,
   type Student,
   type Subject,
 } from '../../lib/supabase';
@@ -222,6 +231,23 @@ const fallbackFees: FeeRecord[] = [
   },
 ];
 
+const fallbackReceipts: PaymentReceipt[] = [
+  {
+    id: 'rcpt-1',
+    fee_record_id: 'fee-1',
+    student_id: '33333333-3333-3333-3333-333333333301',
+    parent_id: '11111111-1111-1111-1111-111111111104',
+    provider: 'Telebirr',
+    transaction_ref: 'TBR-98234109',
+    amount_paid: 3000,
+    receipt_image_url: null,
+    status: 'pending',
+    review_note: null,
+    verified_by: null,
+    created_at: new Date(Date.now() - 3600 * 1000 * 4).toISOString(),
+  },
+];
+
 const fallbackTeachers: Pick<Profile, 'id' | 'full_name' | 'email' | 'role'>[] = [
   {
     id: '11111111-1111-1111-1111-111111111103',
@@ -353,7 +379,9 @@ export function ParentPortal({
   const [subjects, setSubjects] = useState<Subject[]>(fallbackSubjects);
   const [grades, setGrades] = useState<GradeRecord[]>(fallbackGrades);
   const [attendance, setAttendance] = useState<AttendanceRecord[]>(fallbackAttendance);
+  const [smsAlerts, setSmsAlerts] = useState<SmsLog[]>([]);
   const [fees, setFees] = useState<FeeRecord[]>(fallbackFees);
+  const [receipts, setReceipts] = useState<PaymentReceipt[]>(fallbackReceipts);
   const [teachers, setTeachers] = useState<
     Pick<Profile, 'id' | 'full_name' | 'email' | 'role'>[]
   >(fallbackTeachers);
@@ -364,6 +392,18 @@ export function ParentPortal({
   const [selectedSemester, setSelectedSemester] = useState<'1' | '2'>('1');
   const [reportCardOpen, setReportCardOpen] = useState(false);
   const [toast, setToast] = useState('');
+
+  // Payment Receipt Upload Form State
+  const [receiptForm, setReceiptForm] = useState({
+    fee_record_id: '',
+    provider: 'Telebirr' as PaymentProvider,
+    transaction_ref: '',
+    amount_paid: 0,
+    receipt_image_url: '' as string,
+    fileName: '',
+  });
+  const [submittingReceipt, setSubmittingReceipt] = useState(false);
+  const [previewImage, setPreviewImage] = useState<string | null>(null);
 
   // Teacher Messaging State
   const [selectedTeacherId, setSelectedTeacherId] = useState<string>(
@@ -380,14 +420,13 @@ export function ParentPortal({
 
   const showToast = (msg: string) => {
     setToast(msg);
-    setTimeout(() => setToast(''), 3400);
+    setTimeout(() => setToast(''), 3500);
   };
 
   useEffect(() => {
     if (!isSupabaseConfigured || !supabase) return;
 
     const loadParentPortalData = async () => {
-      // 1. Load linked students for this parent
       const { data: linksData } = await supabase
         .from('parent_student_links')
         .select('student_id')
@@ -408,7 +447,7 @@ export function ParentPortal({
           setSelectedChildId(loadedKids[0].id);
         }
 
-        const [gradesRes, attRes, feesRes] = await Promise.all([
+        const [gradesRes, attRes, smsRes, feesRes, receiptsRes] = await Promise.all([
           supabase
             .from('grades')
             .select('*')
@@ -419,12 +458,24 @@ export function ParentPortal({
             .select('*')
             .in('student_id', linkedStudentIds)
             .order('date', { ascending: false }),
+          supabase
+            .from('sms_logs')
+            .select('*')
+            .in('student_id', linkedStudentIds)
+            .order('created_at', { ascending: false }),
           supabase.from('fee_records').select('*').in('student_id', linkedStudentIds),
+          supabase
+            .from('payment_receipts')
+            .select('*')
+            .eq('parent_id', user.id)
+            .order('created_at', { ascending: false }),
         ]);
 
         if (gradesRes.data) setGrades(gradesRes.data as GradeRecord[]);
         if (attRes.data) setAttendance(attRes.data as AttendanceRecord[]);
+        if (smsRes.data) setSmsAlerts(smsRes.data as SmsLog[]);
         if (feesRes.data) setFees(feesRes.data as FeeRecord[]);
+        if (receiptsRes.data) setReceipts(receiptsRes.data as PaymentReceipt[]);
       }
 
       const [subjectsRes, messagesRes, annRes, feedbackRes] = await Promise.all([
@@ -450,7 +501,6 @@ export function ParentPortal({
       if (messagesRes.data) {
         const loadedMsgs = messagesRes.data as MessageRecord[];
         setMessages(loadedMsgs);
-        // Resolve teacher IDs from messages or grades
         const teacherIds = new Set<string>(['11111111-1111-1111-1111-111111111103']);
         loadedMsgs.forEach((m) => {
           if (m.sender_id !== user.id) teacherIds.add(m.sender_id);
@@ -522,11 +572,16 @@ export function ParentPortal({
     return 'A';
   }, [childSemesterGrades]);
 
-  // Attendance for Active Child
+  // Attendance & SMS Alerts for Active Child
   const childAttendance = useMemo(() => {
     if (!activeChild) return [];
     return attendance.filter((a) => a.student_id === activeChild.id);
   }, [attendance, activeChild]);
+
+  const childSmsAlerts = useMemo(() => {
+    if (!activeChild) return [];
+    return smsAlerts.filter((s) => s.student_id === activeChild.id);
+  }, [smsAlerts, activeChild]);
 
   const attendanceRate = useMemo(() => {
     if (childAttendance.length === 0) return '100%';
@@ -536,17 +591,128 @@ export function ParentPortal({
     return `${((presentOrLate / childAttendance.length) * 100).toFixed(1)}%`;
   }, [childAttendance]);
 
-  // Fees for Active Child
+  // Fees & Receipts for Active Child
   const childFees = useMemo(() => {
     if (!activeChild) return [];
     return fees.filter((f) => f.student_id === activeChild.id);
   }, [fees, activeChild]);
+
+  const childReceipts = useMemo(() => {
+    if (!activeChild) return [];
+    return receipts.filter((r) => r.student_id === activeChild.id);
+  }, [receipts, activeChild]);
+
+  useEffect(() => {
+    const unpaid = childFees.find(
+      (f) => Number(f.amount_due) - Number(f.amount_paid) > 0
+    );
+    const targetFee = unpaid || childFees[0];
+    if (targetFee) {
+      const rem = Math.max(0, Number(targetFee.amount_due) - Number(targetFee.amount_paid));
+      setReceiptForm((prev) => ({
+        ...prev,
+        fee_record_id: targetFee.id,
+        amount_paid: rem > 0 ? rem : Number(targetFee.amount_due),
+      }));
+    }
+  }, [childFees]);
 
   const childFeeSummary = useMemo(() => {
     const due = childFees.reduce((acc, f) => acc + Number(f.amount_due || 0), 0);
     const paid = childFees.reduce((acc, f) => acc + Number(f.amount_paid || 0), 0);
     return { due, paid, balance: Math.max(0, due - paid) };
   }, [childFees]);
+
+  const handleReceiptFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    if (file.size > 4 * 1024 * 1024) {
+      showToast(
+        isAm
+          ? 'የምስሉ መጠን ከ 4MB መብለጥ የለበትም።'
+          : 'Receipt image must be smaller than 4MB.'
+      );
+      return;
+    }
+
+    const reader = new FileReader();
+    reader.onload = () => {
+      const result = typeof reader.result === 'string' ? reader.result : '';
+      setReceiptForm((prev) => ({
+        ...prev,
+        receipt_image_url: result,
+        fileName: file.name,
+      }));
+    };
+    reader.readAsDataURL(file);
+  };
+
+  const handleSubmitReceipt = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!activeChild || !receiptForm.fee_record_id || !receiptForm.transaction_ref.trim()) {
+      return;
+    }
+    if (receiptForm.amount_paid <= 0) {
+      showToast(
+        isAm ? 'እባክዎ ትክክለኛ የክፍያ መጠን ያስገቡ።' : 'Please enter a valid payment amount.'
+      );
+      return;
+    }
+
+    setSubmittingReceipt(true);
+
+    const payload = {
+      fee_record_id: receiptForm.fee_record_id,
+      student_id: activeChild.id,
+      parent_id: user.id,
+      provider: receiptForm.provider,
+      transaction_ref: receiptForm.transaction_ref.trim().toUpperCase(),
+      amount_paid: Number(receiptForm.amount_paid),
+      receipt_image_url: receiptForm.receipt_image_url || null,
+      status: 'pending' as const,
+      review_note: null,
+      verified_by: null,
+    };
+
+    if (isSupabaseConfigured && supabase) {
+      const { data, error } = await supabase
+        .from('payment_receipts')
+        .insert([payload])
+        .select()
+        .single();
+
+      if (error) {
+        setSubmittingReceipt(false);
+        showToast(error.message);
+        return;
+      }
+      if (data) {
+        setReceipts((prev) => [data as PaymentReceipt, ...prev]);
+      }
+    } else {
+      setReceipts((prev) => [
+        {
+          id: `rcpt-${Date.now()}`,
+          created_at: new Date().toISOString(),
+          ...payload,
+        },
+        ...prev,
+      ]);
+    }
+
+    setSubmittingReceipt(false);
+    setReceiptForm((prev) => ({
+      ...prev,
+      transaction_ref: '',
+      receipt_image_url: '',
+      fileName: '',
+    }));
+    showToast(
+      isAm
+        ? 'የክፍያ ደረሰኝዎ ለማረጋገጫ ወደ ትምህርት ቤቱ ተልኳል።'
+        : 'Payment receipt submitted for verification by Selam Academy finance.'
+    );
+  };
 
   // Messages for Active Child & Selected Teacher
   const childMessages = useMemo(() => {
@@ -647,6 +813,10 @@ export function ParentPortal({
     );
   };
 
+  const selectedProviderDetails = PAYMENT_PROVIDERS.find(
+    (p) => p.name === receiptForm.provider
+  );
+
   return (
     <div className="space-y-5">
       {toast && (
@@ -656,7 +826,7 @@ export function ParentPortal({
         </div>
       )}
 
-      {/* CHILD SWITCHER BAR (Visible across all Parent tabs) */}
+      {/* CHILD SWITCHER BAR */}
       <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-[#dbe4df] bg-white px-4 py-3 no-print">
         <div className="flex items-center gap-2 text-xs font-semibold text-[#547268]">
           <ShieldCheck size={16} className="text-[#0b6248]" />
@@ -685,7 +855,9 @@ export function ParentPortal({
                     selected ? 'bg-white/15 text-[#e4b65e]' : 'bg-white text-[#71847b]'
                   }`}
                 >
-                  {isAm ? `ክፍል ${child.grade} ${child.section}` : `Grade ${child.grade} ${child.section}`}
+                  {isAm
+                    ? `ክፍል ${child.grade} ${child.section}`
+                    : `Grade ${child.grade} ${child.section}`}
                 </span>
               </button>
             );
@@ -981,88 +1153,124 @@ export function ParentPortal({
         </section>
       )}
 
-      {/* TAB 2: MANNER, CONDUCT & ATTENDANCE FEED */}
+      {/* TAB 2: MANNER, CONDUCT & ATTENDANCE + SMS ABSENCE ALERTS */}
       {activeNavIndex === 2 && activeChild && (
-        <div className="grid gap-5 lg:grid-cols-2">
-          <section className="panel">
-            <div className="panel-heading">
-              <div>
-                <p className="eyebrow">{isAm ? 'የዕለት ክትትል' : 'Attendance History'}</p>
-                <h2>
-                  {isAm
-                    ? `የ${activeChild.full_name} የተገኝነት መዝገብ`
-                    : `${activeChild.full_name}’s Daily Attendance`}
-                </h2>
-              </div>
-              <span className="status active">{attendanceRate}</span>
-            </div>
-            <div className="table-wrap">
-              <table>
-                <thead>
-                  <tr>
-                    <th>{isAm ? 'ቀን' : 'Date'}</th>
-                    <th>{isAm ? 'ሁኔታ' : 'Status'}</th>
-                    <th>{isAm ? 'የመምህር ማስታወሻ' : 'Teacher Note'}</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {childAttendance.map((att) => (
-                    <tr key={att.id}>
-                      <td className="font-mono text-xs">{att.date}</td>
-                      <td>
-                        <span
-                          className={`rounded px-2 py-0.5 text-[10px] font-bold uppercase ${
-                            att.status === 'present'
-                              ? 'bg-[#e9f5ed] text-[#3b805d]'
-                              : att.status === 'absent'
-                              ? 'bg-[#fae9e5] text-[#b34a3c]'
-                              : 'bg-[#faead0] text-[#a9691f]'
-                          }`}
-                        >
-                          {att.status}
-                        </span>
-                      </td>
-                      <td className="text-[#587066]">{att.note || '—'}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          </section>
-
-          <section className="panel">
-            <div className="panel-heading">
-              <div>
-                <p className="eyebrow">{isAm ? 'ባህሪ እና ተሳትፎ' : 'Behavioral & Manner Notes'}</p>
-                <h2>
-                  {isAm
-                    ? 'የመምህራን የስነ-ምግባር ግምገማ'
-                    : 'Subject Conduct & Teacher Remarks'}
-                </h2>
-              </div>
-            </div>
-            <div className="space-y-3">
-              {childSemesterGrades.map((g) => (
-                <div
-                  key={g.id}
-                  className="rounded-lg border border-[#e4ebe7] bg-[#fbfcfb] p-3.5 text-xs"
-                >
-                  <div className="flex items-center justify-between">
-                    <b className="text-[#19362b]">{g.subjectName}</b>
-                    <span className="rounded bg-[#fbf0d9] px-2.5 py-0.5 text-[10px] font-bold text-[#aa7623]">
-                      {isAm ? 'ስነ-ምግባር፡' : 'Conduct:'} {g.conduct || 'A'}
-                    </span>
-                  </div>
-                  <p className="mt-1.5 text-[#587066]">
-                    {g.remarks ||
-                      (isAm
-                        ? 'ምንም ልዩ አስተያየት አልተጻፈም።'
-                        : 'No additional behavioral remark recorded.')}
+        <div className="space-y-5">
+          {childSmsAlerts.length > 0 && (
+            <section className="panel border border-[#f0c7bf] bg-[#fffaf9]">
+              <div className="panel-heading">
+                <div>
+                  <p className="eyebrow text-[#b34a3c]">
+                    {isAm ? 'የSMS የመቅረት ማንቂያዎች' : 'SMS Absence Notifications'}
                   </p>
+                  <h2>
+                    {isAm
+                      ? `ወደ ስልክዎ (${activeChild.guardian_phone || ''}) የተላኩ የSMS ማሳወቂያዎች`
+                      : `Absence SMS Alerts Sent to ${activeChild.guardian_phone || 'Guardian Phone'}`}
+                  </h2>
                 </div>
-              ))}
-            </div>
-          </section>
+                <PhoneCall size={18} className="text-[#b34a3c]" />
+              </div>
+              <div className="space-y-2.5 text-xs">
+                {childSmsAlerts.map((sms) => (
+                  <div
+                    key={sms.id}
+                    className="rounded-lg border border-[#f2d6d0] bg-white p-3.5"
+                  >
+                    <div className="flex items-center justify-between mb-1">
+                      <b className="text-[#b34a3c]">{sms.alert_date}</b>
+                      <span className="rounded bg-[#e9f5ed] px-2 py-0.5 text-[10px] font-bold uppercase text-[#3b805d]">
+                        SMS {sms.status}
+                      </span>
+                    </div>
+                    <p className="text-[#415b50]">{sms.message_text}</p>
+                  </div>
+                ))}
+              </div>
+            </section>
+          )}
+
+          <div className="grid gap-5 lg:grid-cols-2">
+            <section className="panel">
+              <div className="panel-heading">
+                <div>
+                  <p className="eyebrow">{isAm ? 'የዕለት ክትትል' : 'Attendance History'}</p>
+                  <h2>
+                    {isAm
+                      ? `የ${activeChild.full_name} የተገኝነት መዝገብ`
+                      : `${activeChild.full_name}’s Daily Attendance`}
+                  </h2>
+                </div>
+                <span className="status active">{attendanceRate}</span>
+              </div>
+              <div className="table-wrap">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>{isAm ? 'ቀን' : 'Date'}</th>
+                      <th>{isAm ? 'ሁኔታ' : 'Status'}</th>
+                      <th>{isAm ? 'የመምህር ማስታወሻ' : 'Teacher Note'}</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {childAttendance.map((att) => (
+                      <tr key={att.id}>
+                        <td className="font-mono text-xs">{att.date}</td>
+                        <td>
+                          <span
+                            className={`rounded px-2 py-0.5 text-[10px] font-bold uppercase ${
+                              att.status === 'present'
+                                ? 'bg-[#e9f5ed] text-[#3b805d]'
+                                : att.status === 'absent'
+                                ? 'bg-[#fae9e5] text-[#b34a3c]'
+                                : 'bg-[#faead0] text-[#a9691f]'
+                            }`}
+                          >
+                            {att.status}
+                          </span>
+                        </td>
+                        <td className="text-[#587066]">{att.note || '—'}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </section>
+
+            <section className="panel">
+              <div className="panel-heading">
+                <div>
+                  <p className="eyebrow">{isAm ? 'ባህሪ እና ተሳትፎ' : 'Behavioral & Manner Notes'}</p>
+                  <h2>
+                    {isAm
+                      ? 'የመምህራን የስነ-ምግባር ግምገማ'
+                      : 'Subject Conduct & Teacher Remarks'}
+                  </h2>
+                </div>
+              </div>
+              <div className="space-y-3">
+                {childSemesterGrades.map((g) => (
+                  <div
+                    key={g.id}
+                    className="rounded-lg border border-[#e4ebe7] bg-[#fbfcfb] p-3.5 text-xs"
+                  >
+                    <div className="flex items-center justify-between">
+                      <b className="text-[#19362b]">{g.subjectName}</b>
+                      <span className="rounded bg-[#fbf0d9] px-2.5 py-0.5 text-[10px] font-bold text-[#aa7623]">
+                        {isAm ? 'ስነ-ምግባር፡' : 'Conduct:'} {g.conduct || 'A'}
+                      </span>
+                    </div>
+                    <p className="mt-1.5 text-[#587066]">
+                      {g.remarks ||
+                        (isAm
+                          ? 'ምንም ልዩ አስተያየት አልተጻፈም።'
+                          : 'No additional behavioral remark recorded.')}
+                    </p>
+                  </div>
+                ))}
+              </div>
+            </section>
+          </div>
         </div>
       )}
 
@@ -1174,76 +1382,343 @@ export function ParentPortal({
         </div>
       )}
 
-      {/* TAB 4: TUITION & FEE STATUS */}
+      {/* TAB 4: TUITION & FEE STATUS + TELEBIRR / BANK RECEIPT SUBMISSION */}
       {activeNavIndex === 4 && activeChild && (
-        <section className="panel">
-          <div className="panel-heading">
-            <div>
-              <p className="eyebrow">
-                {activeChild.full_name} · {activeChild.student_id}
-              </p>
-              <h2>{isAm ? 'የትምህርት ቤት ክፍያ ሁኔታ (ETB)' : 'Tuition & Transport Fee Status'}</h2>
+        <div className="space-y-5">
+          <section className="panel">
+            <div className="panel-heading">
+              <div>
+                <p className="eyebrow">
+                  {activeChild.full_name} · {activeChild.student_id}
+                </p>
+                <h2>
+                  {isAm
+                    ? 'የትምህርት ቤት ክፍያ ሁኔታ (ETB)'
+                    : 'Tuition & Transport Fee Invoices'}
+                </h2>
+              </div>
+              <div className="text-right text-xs">
+                <span className="text-[#71847b]">
+                  {isAm ? 'ጠቅላላ ቀሪ ክፍያ፡ ' : 'Remaining Balance: '}
+                </span>
+                <strong className="text-base text-[#b34a3c]">
+                  {childFeeSummary.balance.toLocaleString()} ETB
+                </strong>
+              </div>
             </div>
-            <div className="text-right text-xs">
-              <span className="text-[#71847b]">
-                {isAm ? 'ጠቅላላ ቀሪ ክፍያ፡ ' : 'Remaining Balance: '}
-              </span>
-              <strong className="text-base text-[#b34a3c]">
-                {childFeeSummary.balance.toLocaleString()} ETB
-              </strong>
-            </div>
-          </div>
 
-          <div className="table-wrap">
-            <table>
-              <thead>
-                <tr>
-                  <th>{isAm ? 'የክፍያ ዓይነት' : 'Fee Description'}</th>
-                  <th>{isAm ? 'ጠቅላላ ክፍያ' : 'Amount Due'}</th>
-                  <th>{isAm ? 'የተከፈለ' : 'Amount Paid'}</th>
-                  <th>{isAm ? 'ቀሪ ሂሳብ' : 'Balance'}</th>
-                  <th>{isAm ? 'የመክፈያ ቀን' : 'Due Date'}</th>
-                  <th>{isAm ? 'ሁኔታ' : 'Status'}</th>
-                </tr>
-              </thead>
-              <tbody>
-                {childFees.map((fee) => {
-                  const bal = Math.max(0, Number(fee.amount_due) - Number(fee.amount_paid));
-                  return (
-                    <tr key={fee.id}>
-                      <td className="font-semibold text-[#19362b]">{fee.description}</td>
-                      <td>{Number(fee.amount_due).toLocaleString()} ETB</td>
-                      <td className="text-[#277453] font-semibold">
-                        {Number(fee.amount_paid).toLocaleString()} ETB
-                      </td>
-                      <td className="font-bold text-[#19362b]">
-                        {bal.toLocaleString()} ETB
-                      </td>
-                      <td className="muted-cell">{fee.due_date || '—'}</td>
-                      <td>
-                        <span
-                          className={`rounded px-2 py-0.5 text-[10px] font-bold uppercase ${
-                            bal === 0
-                              ? 'bg-[#e9f5ed] text-[#3b805d]'
-                              : 'bg-[#faead0] text-[#a9691f]'
-                          }`}
-                        >
-                          {bal === 0
-                            ? isAm
-                              ? 'ተከፍሏል'
-                              : 'Paid'
-                            : isAm
-                            ? 'ቀሪ አለው'
-                            : 'Partial / Due'}
-                        </span>
-                      </td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
+            <div className="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>{isAm ? 'የክፍያ ዓይነት' : 'Fee Description'}</th>
+                    <th>{isAm ? 'ጠቅላላ ክፍያ' : 'Amount Due'}</th>
+                    <th>{isAm ? 'የተከፈለ' : 'Amount Paid'}</th>
+                    <th>{isAm ? 'ቀሪ ሂሳብ' : 'Balance'}</th>
+                    <th>{isAm ? 'የመክፈያ ቀን' : 'Due Date'}</th>
+                    <th>{isAm ? 'ሁኔታ' : 'Status'}</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {childFees.map((fee) => {
+                    const bal = Math.max(0, Number(fee.amount_due) - Number(fee.amount_paid));
+                    return (
+                      <tr key={fee.id}>
+                        <td className="font-semibold text-[#19362b]">{fee.description}</td>
+                        <td>{Number(fee.amount_due).toLocaleString()} ETB</td>
+                        <td className="text-[#277453] font-semibold">
+                          {Number(fee.amount_paid).toLocaleString()} ETB
+                        </td>
+                        <td className="font-bold text-[#19362b]">
+                          {bal.toLocaleString()} ETB
+                        </td>
+                        <td className="muted-cell">{fee.due_date || '—'}</td>
+                        <td>
+                          <span
+                            className={`rounded px-2 py-0.5 text-[10px] font-bold uppercase ${
+                              bal === 0
+                                ? 'bg-[#e9f5ed] text-[#3b805d]'
+                                : 'bg-[#faead0] text-[#a9691f]'
+                            }`}
+                          >
+                            {bal === 0
+                              ? isAm
+                                ? 'ተከፍሏል'
+                                : 'Paid'
+                              : isAm
+                              ? 'ቀሪ አለው'
+                              : 'Partial / Due'}
+                          </span>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          </section>
+
+          <div className="grid gap-5 lg:grid-cols-[390px_1fr]">
+            <section className="panel h-fit">
+              <div className="panel-heading">
+                <div>
+                  <p className="eyebrow">
+                    {isAm ? 'የባንክ / ቴሌብር ደረሰኝ' : 'Digital Payment Proof'}
+                  </p>
+                  <h2>
+                    {isAm
+                      ? 'የክፍያ ደረሰኝ ያስገቡ'
+                      : 'Submit Payment Receipt'}
+                  </h2>
+                </div>
+                <Receipt size={18} className="text-[#0b6248]" />
+              </div>
+
+              <form onSubmit={handleSubmitReceipt} className="space-y-3 text-xs">
+                <label className="block font-semibold text-[#3c5149]">
+                  {isAm ? 'የክፍያ ዓይነት ይምረጡ' : 'Select Fee Invoice'}
+                  <select
+                    className="mt-1 w-full rounded-lg border border-[#d9e2dd] bg-white px-3 py-2.5 outline-none focus:border-[#157052]"
+                    value={receiptForm.fee_record_id}
+                    onChange={(e) => {
+                      const feeId = e.target.value;
+                      const found = childFees.find((f) => f.id === feeId);
+                      const rem = found
+                        ? Math.max(0, Number(found.amount_due) - Number(found.amount_paid))
+                        : 0;
+                      setReceiptForm((prev) => ({
+                        ...prev,
+                        fee_record_id: feeId,
+                        amount_paid: rem > 0 ? rem : prev.amount_paid,
+                      }));
+                    }}
+                    required
+                  >
+                    {childFees.map((f) => {
+                      const rem = Math.max(0, Number(f.amount_due) - Number(f.amount_paid));
+                      return (
+                        <option key={f.id} value={f.id}>
+                          {f.description} (Balance: {rem.toLocaleString()} ETB)
+                        </option>
+                      );
+                    })}
+                  </select>
+                </label>
+
+                <label className="block font-semibold text-[#3c5149]">
+                  {isAm ? 'የክፍያ አማራጭ (ባንክ / ቴሌብር)' : 'Bank / Mobile Money Provider'}
+                  <select
+                    className="mt-1 w-full rounded-lg border border-[#d9e2dd] bg-white px-3 py-2.5 outline-none focus:border-[#157052]"
+                    value={receiptForm.provider}
+                    onChange={(e) =>
+                      setReceiptForm((prev) => ({
+                        ...prev,
+                        provider: e.target.value as PaymentProvider,
+                      }))
+                    }
+                  >
+                    {PAYMENT_PROVIDERS.map((prov) => (
+                      <option key={prov.name} value={prov.name}>
+                        {prov.name}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+
+                {selectedProviderDetails && (
+                  <div className="rounded-lg border border-[#cde3d6] bg-[#f4faf6] p-3 text-[11px] space-y-1">
+                    <div className="flex items-center gap-1.5 font-bold text-[#073c2f]">
+                      <Building2 size={13} className="text-[#0b6248]" />
+                      <span>
+                        {isAm
+                          ? `የሰላም አካዳሚ ${selectedProviderDetails.name} ሂሳብ`
+                          : `Selam Academy ${selectedProviderDetails.name} Account`}
+                      </span>
+                    </div>
+                    <p className="text-[#365247]">
+                      <b>{isAm ? 'ስም፡' : 'Name:'}</b> {selectedProviderDetails.accountTitle}
+                    </p>
+                    <p className="font-mono text-[#0b6248] font-bold">
+                      {selectedProviderDetails.accountNumber}
+                    </p>
+                  </div>
+                )}
+
+                <div className="grid grid-cols-2 gap-3">
+                  <label className="block font-semibold text-[#3c5149]">
+                    {isAm ? 'የግብይት መለያ (Ref No.)' : 'Transaction Ref No.'}
+                    <input
+                      className="mt-1 w-full rounded-lg border border-[#d9e2dd] px-3 py-2 font-mono uppercase outline-none focus:border-[#157052]"
+                      placeholder="e.g. FT26319..."
+                      value={receiptForm.transaction_ref}
+                      onChange={(e) =>
+                        setReceiptForm((prev) => ({
+                          ...prev,
+                          transaction_ref: e.target.value,
+                        }))
+                      }
+                      required
+                    />
+                  </label>
+
+                  <label className="block font-semibold text-[#3c5149]">
+                    {isAm ? 'የተከፈለ መጠን (ETB)' : 'Amount Paid (ETB)'}
+                    <input
+                      type="number"
+                      min={1}
+                      step="0.01"
+                      className="mt-1 w-full rounded-lg border border-[#d9e2dd] px-3 py-2 font-semibold outline-none focus:border-[#157052]"
+                      value={receiptForm.amount_paid}
+                      onChange={(e) =>
+                        setReceiptForm((prev) => ({
+                          ...prev,
+                          amount_paid: Number(e.target.value),
+                        }))
+                      }
+                      required
+                    />
+                  </label>
+                </div>
+
+                <label className="block font-semibold text-[#3c5149]">
+                  {isAm ? 'የደረሰኝ ፎቶ / ስክሪንሾት ያያይዙ' : 'Attach Receipt Screenshot / Photo'}
+                  <div className="mt-1 flex items-center justify-between rounded-lg border border-dashed border-[#9dc2b4] bg-[#fbfcfb] px-3 py-2.5">
+                    <span className="truncate text-[11px] text-[#587066]">
+                      {receiptForm.fileName ||
+                        (isAm ? 'ምስል ይምረጡ (JPG, PNG)...' : 'Choose image (JPG, PNG)...')}
+                    </span>
+                    <label className="inline-flex cursor-pointer items-center gap-1 rounded bg-[#e3f1e9] px-2.5 py-1 text-[11px] font-bold text-[#0b6248] hover:bg-[#d2e9dc]">
+                      <Upload size={12} /> {isAm ? 'ምረጥ' : 'Upload'}
+                      <input
+                        type="file"
+                        accept="image/*"
+                        className="hidden"
+                        onChange={handleReceiptFileChange}
+                      />
+                    </label>
+                  </div>
+                </label>
+
+                <button
+                  type="submit"
+                  disabled={submittingReceipt}
+                  className="primary-button w-full"
+                >
+                  <CheckCircle2 size={15} />{' '}
+                  {submittingReceipt
+                    ? isAm
+                      ? 'በመላክ ላይ...'
+                      : 'Submitting...'
+                    : isAm
+                    ? 'ደረሰኙን ለማረጋገጫ ላክ'
+                    : 'Submit Receipt for Verification'}
+                </button>
+              </form>
+            </section>
+
+            <section className="panel">
+              <div className="panel-heading">
+                <div>
+                  <p className="eyebrow">
+                    {isAm ? 'የተላኩ ደረሰኞች' : 'Verification Tracker'}
+                  </p>
+                  <h2>
+                    {isAm
+                      ? `የ${activeChild.full_name} የክፍያ ደረሰኝ ታሪክ`
+                      : `${activeChild.full_name}’s Submitted Payment Receipts`}
+                  </h2>
+                </div>
+              </div>
+
+              {childReceipts.length === 0 ? (
+                <div className="empty-content">
+                  <span className="empty-icon">
+                    <Receipt size={24} />
+                  </span>
+                  <h3>
+                    {isAm ? 'እስካሁን የተላከ ደረሰኝ የለም' : 'No payment receipts submitted yet'}
+                  </h3>
+                  <p>
+                    {isAm
+                      ? 'በቴሌብር፣ CBE፣ ሂጅራ፣ ዘምዘም ወይም ራሚስ ባንክ ከከፈሉ በኋላ ደረሰኙን እዚህ ያስገቡ።'
+                      : 'After paying via Telebirr, CBE, Hijra Bank, ZemZem Bank, or Rammis Bank, upload your receipt on the left.'}
+                  </p>
+                </div>
+              ) : (
+                <div className="table-wrap">
+                  <table>
+                    <thead>
+                      <tr>
+                        <th>{isAm ? 'ባንክ / ቴሌብር' : 'Provider'}</th>
+                        <th>{isAm ? 'የግብይት መለያ' : 'Transaction Ref'}</th>
+                        <th>{isAm ? 'መጠን' : 'Amount'}</th>
+                        <th>{isAm ? 'ደረሰኝ' : 'Receipt'}</th>
+                        <th>{isAm ? 'ሁኔታ' : 'Verification Status'}</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {childReceipts.map((rcpt) => (
+                        <tr key={rcpt.id}>
+                          <td>
+                            <span className="rounded bg-[#e4f0f5] px-2 py-0.5 text-[10px] font-bold text-[#397b98]">
+                              {rcpt.provider}
+                            </span>
+                          </td>
+                          <td className="font-mono font-semibold text-[#19362b]">
+                            {rcpt.transaction_ref}
+                          </td>
+                          <td className="font-bold text-[#073c2f]">
+                            {Number(rcpt.amount_paid).toLocaleString()} ETB
+                          </td>
+                          <td>
+                            {rcpt.receipt_image_url ? (
+                              <button
+                                type="button"
+                                onClick={() => setPreviewImage(rcpt.receipt_image_url)}
+                                className="inline-flex items-center gap-1 text-[11px] font-semibold text-[#0b6248] hover:underline"
+                              >
+                                <ImageIcon size={13} /> {isAm ? 'ምስል እይ' : 'View'}
+                              </button>
+                            ) : (
+                              <span className="muted-cell">—</span>
+                            )}
+                          </td>
+                          <td>
+                            {rcpt.status === 'verified' && (
+                              <span className="inline-flex items-center gap-1 rounded bg-[#e9f5ed] px-2 py-0.5 text-[10px] font-bold text-[#3b805d]">
+                                <CheckCircle2 size={11} />{' '}
+                                {isAm ? 'ተረጋግጧል' : 'Verified'}
+                              </span>
+                            )}
+                            {rcpt.status === 'pending' && (
+                              <span className="inline-flex items-center gap-1 rounded bg-[#faead0] px-2 py-0.5 text-[10px] font-bold text-[#a9691f]">
+                                <Clock size={11} />{' '}
+                                {isAm ? 'በመረጋገጥ ላይ' : 'Pending Review'}
+                              </span>
+                            )}
+                            {rcpt.status === 'rejected' && (
+                              <div>
+                                <span className="inline-flex items-center gap-1 rounded bg-[#fae9e5] px-2 py-0.5 text-[10px] font-bold text-[#b34a3c]">
+                                  <XCircle size={11} />{' '}
+                                  {isAm ? 'ተመልሷል' : 'Rejected'}
+                                </span>
+                                {rcpt.review_note && (
+                                  <small className="block text-[10px] text-[#b34a3c] mt-0.5">
+                                    {rcpt.review_note}
+                                  </small>
+                                )}
+                              </div>
+                            )}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </section>
           </div>
-        </section>
+        </div>
       )}
 
       {/* TAB 5: FAMILY FEEDBACK TO SCHOOL MANAGEMENT */}
@@ -1373,6 +1848,37 @@ export function ParentPortal({
         </div>
       )}
 
+      {/* RECEIPT IMAGE PREVIEW LIGHTBOX */}
+      {previewImage && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4"
+          onClick={() => setPreviewImage(null)}
+        >
+          <div
+            className="relative max-w-xl w-full rounded-xl bg-white p-4 shadow-2xl"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="mb-2 flex items-center justify-between">
+              <b className="text-xs text-[#19362b]">
+                {isAm ? 'የክፍያ ደረሰኝ ምስል' : 'Payment Receipt Attachment'}
+              </b>
+              <button
+                type="button"
+                onClick={() => setPreviewImage(null)}
+                className="rounded p-1 text-[#587066] hover:bg-[#f4f7f5]"
+              >
+                <X size={16} />
+              </button>
+            </div>
+            <img
+              src={previewImage}
+              alt="Payment receipt"
+              className="max-h-[75vh] w-full rounded-lg object-contain border border-[#e4ebe7]"
+            />
+          </div>
+        </div>
+      )}
+
       {/* OFFICIAL PRINTABLE SELAM ACADEMY REPORT CARD MODAL */}
       {reportCardOpen && activeChild && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/55 p-4 overflow-y-auto">
@@ -1399,7 +1905,6 @@ export function ParentPortal({
               </div>
             </div>
 
-            {/* Official Header */}
             <div className="border-2 border-[#073c2f] rounded-lg p-6 space-y-5">
               <div className="flex flex-wrap items-center justify-between gap-4 border-b-2 border-[#073c2f] pb-4">
                 <div className="flex items-center gap-3">
@@ -1425,7 +1930,6 @@ export function ParentPortal({
                 </div>
               </div>
 
-              {/* Student Details Grid */}
               <div className="grid grid-cols-2 gap-3 rounded-lg bg-[#f8fbf9] p-3.5 text-xs sm:grid-cols-4 border border-[#e4ebe7]">
                 <div>
                   <span className="block text-[10px] text-[#71847b]">
@@ -1455,7 +1959,6 @@ export function ParentPortal({
                 </div>
               </div>
 
-              {/* Grades Table */}
               <table className="w-full border-collapse text-xs">
                 <thead>
                   <tr className="bg-[#073c2f] text-white">
@@ -1487,7 +1990,6 @@ export function ParentPortal({
                 </tbody>
               </table>
 
-              {/* Summary & Signatures */}
               <div className="grid grid-cols-3 gap-3 rounded-lg border border-[#dbe4df] bg-[#fbfcfb] p-3 text-xs">
                 <div>
                   <span className="text-[#71847b]">Semester Average: </span>
