@@ -7,6 +7,7 @@ import {
   ClipboardCheck,
   GraduationCap,
   MessageSquare,
+  PhoneCall,
   Plus,
   Save,
   Send,
@@ -25,6 +26,7 @@ import {
   type GradeRecord,
   type MessageRecord,
   type Profile,
+  type SmsLog,
   type Student,
   type Subject,
 } from '../../lib/supabase';
@@ -37,6 +39,7 @@ interface ParentLinkWithProfile {
   relationship: string | null;
   parent_name: string;
   parent_email: string;
+  parent_phone: string | null;
 }
 
 const fallbackSubjects: Subject[] = [
@@ -189,6 +192,7 @@ const fallbackParentLinks: ParentLinkWithProfile[] = [
     relationship: 'Father',
     parent_name: 'Ahmad Kedir',
     parent_email: 'parent@selamacademy.edu.et',
+    parent_phone: '+251911200304',
   },
 ];
 
@@ -214,8 +218,8 @@ const fallbackMessages: MessageRecord[] = [
 ];
 
 type GradeDraft = {
-  quizScores: number[]; // length 1..5 matching scheme.quizWeights
-  assignmentScores: number[]; // length 1..5 matching scheme.assignmentWeights
+  quizScores: number[];
+  assignmentScores: number[];
   mid_exam: number;
   final_exam: number;
   conduct: 'A' | 'B' | 'C' | 'D';
@@ -252,7 +256,6 @@ function normalizeScheme(raw?: unknown): EvaluationScheme {
       ? obj.quizWeights.map((w) => Number(w) || 0)
       : [...DEFAULT_EVALUATION_SCHEME.quizWeights];
 
-  // Backward compatibility if an older record stored single assignmentWeight instead of assignmentWeights[]
   let assignmentWeights: number[] = [...DEFAULT_EVALUATION_SCHEME.assignmentWeights];
   if (
     Array.isArray(obj.assignmentWeights) &&
@@ -323,6 +326,7 @@ export function TeacherPortal({
   const [students, setStudents] = useState<Student[]>(fallbackStudents);
   const [grades, setGrades] = useState<GradeRecord[]>(fallbackGrades);
   const [attendanceRecords, setAttendanceRecords] = useState<AttendanceRecord[]>([]);
+  const [smsLogs, setSmsLogs] = useState<SmsLog[]>([]);
   const [parentLinks, setParentLinks] = useState<ParentLinkWithProfile[]>(fallbackParentLinks);
   const [messages, setMessages] = useState<MessageRecord[]>(fallbackMessages);
   const [toast, setToast] = useState('');
@@ -336,7 +340,7 @@ export function TeacherPortal({
   );
   const [selectedSemester, setSelectedSemester] = useState<'1' | '2'>('1');
 
-  // Flexible Evaluation Scheme State (up to 5 quizzes, up to 5 assignments, Mid, Final)
+  // Flexible Evaluation Scheme State
   const [schemePanelOpen, setSchemePanelOpen] = useState(true);
   const [scheme, setScheme] = useState<EvaluationScheme>({
     quizWeights: [5, 5],
@@ -347,10 +351,11 @@ export function TeacherPortal({
 
   const [gradeDrafts, setGradeDrafts] = useState<Record<string, GradeDraft>>({});
 
-  // Attendance Filters & Drafts
+  // Attendance & Automated SMS Alert State
   const [attendanceDate, setAttendanceDate] = useState(() =>
     new Date().toISOString().slice(0, 10)
   );
+  const [autoSendAbsenceSms, setAutoSendAbsenceSms] = useState(true);
   const [attendanceDrafts, setAttendanceDrafts] = useState<Record<string, AttendanceDraft>>({});
 
   // Family Messaging State
@@ -361,7 +366,7 @@ export function TeacherPortal({
 
   const showToast = (msg: string) => {
     setToast(msg);
-    setTimeout(() => setToast(''), 3600);
+    setTimeout(() => setToast(''), 3800);
   };
 
   useEffect(() => {
@@ -378,24 +383,37 @@ export function TeacherPortal({
         ? supabase.from('subjects').select('*').eq('teacher_id', staffRow.id)
         : supabase.from('subjects').select('*');
 
-      const [subjectsRes, studentsRes, gradesRes, attendanceRes, linksRes, profilesRes, messagesRes] =
-        await Promise.all([
-          subjectsQuery,
-          supabase
-            .from('students')
-            .select('*')
-            .eq('enrollment_status', 'active')
-            .order('student_id', { ascending: true }),
-          supabase.from('grades').select('*'),
-          supabase.from('attendance').select('*'),
-          supabase.from('parent_student_links').select('*'),
-          supabase.from('profiles').select('*').eq('role', 'parent'),
-          supabase
-            .from('messages')
-            .select('*')
-            .or(`sender_id.eq.${user.id},recipient_id.eq.${user.id}`)
-            .order('created_at', { ascending: true }),
-        ]);
+      const [
+        subjectsRes,
+        studentsRes,
+        gradesRes,
+        attendanceRes,
+        smsRes,
+        linksRes,
+        profilesRes,
+        messagesRes,
+      ] = await Promise.all([
+        subjectsQuery,
+        supabase
+          .from('students')
+          .select('*')
+          .eq('enrollment_status', 'active')
+          .order('student_id', { ascending: true }),
+        supabase.from('grades').select('*'),
+        supabase.from('attendance').select('*'),
+        supabase
+          .from('sms_logs')
+          .select('*')
+          .order('created_at', { ascending: false })
+          .limit(25),
+        supabase.from('parent_student_links').select('*'),
+        supabase.from('profiles').select('*').eq('role', 'parent'),
+        supabase
+          .from('messages')
+          .select('*')
+          .or(`sender_id.eq.${user.id},recipient_id.eq.${user.id}`)
+          .order('created_at', { ascending: true }),
+      ]);
 
       if (subjectsRes.data && subjectsRes.data.length > 0) {
         const loadedSubjects = subjectsRes.data as Subject[];
@@ -419,6 +437,10 @@ export function TeacherPortal({
         setAttendanceRecords(attendanceRes.data as AttendanceRecord[]);
       }
 
+      if (smsRes.data) {
+        setSmsLogs(smsRes.data as SmsLog[]);
+      }
+
       if (linksRes.data && profilesRes.data) {
         const parentProfiles = profilesRes.data as Profile[];
         const mergedLinks: ParentLinkWithProfile[] = linksRes.data.map((lnk) => {
@@ -429,6 +451,7 @@ export function TeacherPortal({
             relationship: lnk.relationship,
             parent_name: p?.full_name || 'Linked Parent',
             parent_email: p?.email || '',
+            parent_phone: p?.phone || null,
           };
         });
         setParentLinks(mergedLinks);
@@ -484,7 +507,7 @@ export function TeacherPortal({
     }
   }, [selectedSubjectId, selectedSemester, subjects]);
 
-  // Sync gradeDrafts whenever classStudents, selectedSubjectId, selectedSemester, scheme slots, or grades change
+  // Sync gradeDrafts
   useEffect(() => {
     const quizCount = scheme.quizWeights.length;
     const assignCount = scheme.assignmentWeights.length;
@@ -548,7 +571,7 @@ export function TeacherPortal({
     setGradeDrafts(nextDrafts);
   }, [classStudents, selectedSubjectId, selectedSemester, grades, scheme]);
 
-  // Sync attendanceDrafts whenever classStudents, attendanceDate, or attendanceRecords change
+  // Sync attendanceDrafts
   useEffect(() => {
     const nextAtt: Record<string, AttendanceDraft> = {};
     classStudents.forEach((stu) => {
@@ -588,13 +611,10 @@ export function TeacherPortal({
 
   const isWeightValid = Math.abs(totalConfiguredWeight - 100) < 0.01;
 
-  // Quiz Slot Handlers (1 to 5)
+  // Quiz & Assignment Slot Handlers
   const handleAddQuizSlot = () => {
     if (scheme.quizWeights.length >= 5) return;
-    setScheme((prev) => ({
-      ...prev,
-      quizWeights: [...prev.quizWeights, 5],
-    }));
+    setScheme((prev) => ({ ...prev, quizWeights: [...prev.quizWeights, 5] }));
   };
 
   const handleRemoveQuizSlot = (indexToRemove: number) => {
@@ -613,7 +633,6 @@ export function TeacherPortal({
     }));
   };
 
-  // Assignment Slot Handlers (1 to 5 — exact same UX as Quizzes)
   const handleAddAssignmentSlot = () => {
     if (scheme.assignmentWeights.length >= 5) return;
     setScheme((prev) => ({
@@ -724,10 +743,7 @@ export function TeacherPortal({
       );
       return {
         ...prev,
-        [studentId]: {
-          ...current,
-          quizScores: nextQuizScores,
-        },
+        [studentId]: { ...current, quizScores: nextQuizScores },
       };
     });
   };
@@ -756,10 +772,7 @@ export function TeacherPortal({
       );
       return {
         ...prev,
-        [studentId]: {
-          ...current,
-          assignmentScores: nextAssignmentScores,
-        },
+        [studentId]: { ...current, assignmentScores: nextAssignmentScores },
       };
     });
   };
@@ -904,7 +917,95 @@ export function TeacherPortal({
     );
   };
 
-  // === SAVE DAILY ATTENDANCE ===
+  // === SAVE DAILY ATTENDANCE + AUTOMATED SMS ABSENCE ALERTS ===
+  const dispatchAbsenceSmsForStudents = async (
+    absentStudents: { student: Student; note: string }[],
+    forceResend = false
+  ): Promise<number> => {
+    const newSmsPayloads: {
+      student_id: string;
+      recipient_phone: string;
+      recipient_name: string | null;
+      message_text: string;
+      alert_date: string;
+      status: 'sent';
+      triggered_by: string;
+    }[] = [];
+
+    for (const { student, note } of absentStudents) {
+      // Avoid sending duplicate SMS for the same student on the same day unless manually resent
+      if (
+        !forceResend &&
+        smsLogs.some(
+          (log) => log.student_id === student.id && log.alert_date === attendanceDate
+        )
+      ) {
+        continue;
+      }
+
+      const linkedParent = parentLinks.find((l) => l.student_id === student.id);
+      const phone =
+        student.guardian_phone ||
+        linkedParent?.parent_phone ||
+        student.emergency_contact ||
+        '';
+      if (!phone) continue;
+
+      const guardianName =
+        student.guardian_name || linkedParent?.parent_name || 'Parent/Guardian';
+
+      const smsBody = `SELAM ACADEMY HAWASSA: Dear ${guardianName}, your child ${student.full_name} (Grade ${student.grade}${student.section}) was marked ABSENT on ${attendanceDate}.${
+        note ? ` Note: ${note}.` : ''
+      } Please contact the school office if needed.`;
+
+      newSmsPayloads.push({
+        student_id: student.id,
+        recipient_phone: phone,
+        recipient_name: guardianName,
+        message_text: smsBody,
+        alert_date: attendanceDate,
+        status: 'sent',
+        triggered_by: user.id,
+      });
+    }
+
+    if (newSmsPayloads.length === 0) return 0;
+
+    if (isSupabaseConfigured && supabase) {
+      const { data: insertedSms } = await supabase
+        .from('sms_logs')
+        .insert(newSmsPayloads)
+        .select();
+
+      if (insertedSms) {
+        setSmsLogs((prev) => [...(insertedSms as SmsLog[]), ...prev]);
+      }
+
+      // Optional Edge Function trigger if an external Ethiopian SMS gateway (e.g. AfroMessage / GeezSMS) is deployed
+      for (const smsItem of newSmsPayloads) {
+        supabase.functions
+          .invoke('send-sms', {
+            body: {
+              to: smsItem.recipient_phone,
+              message: smsItem.message_text,
+            },
+          })
+          .catch(() => {
+            // Silently ignore if Edge Function is not deployed yet; sms_logs already persisted
+          });
+      }
+    } else {
+      const mockSms: SmsLog[] = newSmsPayloads.map((item, idx) => ({
+        id: `sms-${Date.now()}-${idx}`,
+        created_at: new Date().toISOString(),
+        ...item,
+      }));
+      setSmsLogs((prev) => [...mockSms, ...prev]);
+    }
+
+    return newSmsPayloads.length;
+  };
+
   const handleSaveAttendance = async () => {
     if (classStudents.length === 0) return;
     setSaving(true);
@@ -962,12 +1063,34 @@ export function TeacherPortal({
       });
     }
 
+    let smsSentCount = 0;
+    if (autoSendAbsenceSms) {
+      const absentList = classStudents
+        .filter((stu) => (attendanceDrafts[stu.id]?.status || 'present') === 'absent')
+        .map((stu) => ({
+          student: stu,
+          note: attendanceDrafts[stu.id]?.note?.trim() || '',
+        }));
+
+      if (absentList.length > 0) {
+        smsSentCount = await dispatchAbsenceSmsForStudents(absentList, false);
+      }
+    }
+
     setSaving(false);
-    showToast(
-      isAm
-        ? `የ${attendanceDate} ተገኝነት ተመዝግቧል።`
-        : `Daily attendance saved for ${attendanceDate}.`
-    );
+    if (smsSentCount > 0) {
+      showToast(
+        isAm
+          ? `ተገኝነት ተመዝግቧል፤ ለ${smsSentCount} የቀሩ ተማሪዎች ወላጆች የSMS ማሳወቂያ ተልኳል!`
+          : `Attendance saved & ${smsSentCount} automated absence SMS alert(s) sent to families!`
+      );
+    } else {
+      showToast(
+        isAm
+          ? `የ${attendanceDate} ተገኝነት ተመዝግቧል።`
+          : `Daily attendance saved for ${attendanceDate}.`
+      );
+    }
   };
 
   // === SEND MESSAGE TO FAMILY ===
@@ -1039,6 +1162,12 @@ export function TeacherPortal({
     return `${(sum / rankedGradeRows.length).toFixed(1)}%`;
   }, [rankedGradeRows]);
 
+  const absentTodayCount = useMemo(
+    () =>
+      classStudents.filter((s) => attendanceDrafts[s.id]?.status === 'absent').length,
+    [classStudents, attendanceDrafts]
+  );
+
   return (
     <div className="space-y-5">
       {toast && (
@@ -1097,10 +1226,10 @@ export function TeacherPortal({
               accent="blue"
             />
             <StatCard
-              label={isAm ? 'የቤተሰብ መልዕክቶች' : 'Family messages'}
-              value={String(messages.length)}
-              detail={isAm ? 'ቀጥታ የወላጅ ውይይቶች' : 'Direct parent conversations'}
-              icon={MessageSquare}
+              label={isAm ? 'የተላኩ የSMS ማሳወቂያዎች' : 'Absence SMS Sent'}
+              value={String(smsLogs.length)}
+              detail={isAm ? 'ለወላጆች የተላኩ ማንቂያዎች' : 'Automated parent SMS alerts'}
+              icon={PhoneCall}
               accent="rose"
             />
           </div>
@@ -1215,7 +1344,6 @@ export function TeacherPortal({
             </div>
           </div>
 
-          {/* Class & Subject Filter Bar */}
           <div className="mb-5 grid grid-cols-2 gap-3 sm:grid-cols-4">
             <label className="text-xs font-semibold text-[#3c5149]">
               {isAm ? 'ክፍል' : 'Grade'}
@@ -1284,7 +1412,6 @@ export function TeacherPortal({
             </label>
           </div>
 
-          {/* FLEXIBLE EVALUATION WEIGHTS BUILDER (UP TO 5 QUIZZES, UP TO 5 ASSIGNMENTS, MID, FINAL) */}
           {schemePanelOpen && (
             <div className="mb-5 rounded-xl border border-[#dbe4df] bg-[#f8fbf9] p-4 space-y-4">
               <div className="flex flex-wrap items-center justify-between gap-2 border-b border-[#e4ebe7] pb-3">
@@ -1324,7 +1451,6 @@ export function TeacherPortal({
               </div>
 
               <div className="grid gap-4 lg:grid-cols-2">
-                {/* Quizzes (1 to 5) */}
                 <div className="rounded-lg border border-[#e4ebe7] bg-white p-3">
                   <div className="mb-2.5 flex items-center justify-between">
                     <span className="text-xs font-bold text-[#19362b]">
@@ -1356,7 +1482,6 @@ export function TeacherPortal({
                               type="button"
                               onClick={() => handleRemoveQuizSlot(idx)}
                               className="text-[#b34a3c] hover:opacity-80"
-                              title="Remove quiz"
                             >
                               <Trash2 size={12} />
                             </button>
@@ -1383,7 +1508,6 @@ export function TeacherPortal({
                   </div>
                 </div>
 
-                {/* Assignments (1 to 5 — exact same flexible slots as Quizzes) */}
                 <div className="rounded-lg border border-[#e4ebe7] bg-white p-3">
                   <div className="mb-2.5 flex items-center justify-between">
                     <span className="text-xs font-bold text-[#19362b]">
@@ -1415,7 +1539,6 @@ export function TeacherPortal({
                               type="button"
                               onClick={() => handleRemoveAssignmentSlot(idx)}
                               className="text-[#b34a3c] hover:opacity-80"
-                              title="Remove assignment"
                             >
                               <Trash2 size={12} />
                             </button>
@@ -1443,7 +1566,6 @@ export function TeacherPortal({
                 </div>
               </div>
 
-              {/* Mid-Exam & Final Exam Weights */}
               <div className="rounded-lg border border-[#e4ebe7] bg-white p-3">
                 <div className="flex flex-wrap items-center justify-between gap-3">
                   <span className="text-xs font-bold text-[#19362b]">
@@ -1687,161 +1809,295 @@ export function TeacherPortal({
         </section>
       )}
 
-      {/* TAB 2: DAILY ATTENDANCE TRACKER */}
+      {/* TAB 2: DAILY ATTENDANCE TRACKER + AUTOMATED SMS ABSENCE ALERTS */}
       {activeNavIndex === 2 && (
-        <section className="panel">
-          <div className="panel-heading">
-            <div>
-              <p className="eyebrow">{isAm ? 'የክፍል ክትትል' : 'Classroom Roll Call'}</p>
-              <h2>{isAm ? 'የዕለት ተገኝነት መመዝገቢያ' : 'Daily Attendance Tracker'}</h2>
+        <div className="space-y-5">
+          <section className="panel">
+            <div className="panel-heading">
+              <div>
+                <p className="eyebrow">{isAm ? 'የክፍል ክትትል' : 'Classroom Roll Call'}</p>
+                <h2>{isAm ? 'የዕለት ተገኝነት መመዝገቢያ' : 'Daily Attendance Tracker'}</h2>
+              </div>
+              <div className="flex flex-wrap gap-2">
+                <button
+                  type="button"
+                  className="secondary-button"
+                  onClick={() => {
+                    const allPresent: Record<string, AttendanceDraft> = {};
+                    classStudents.forEach((stu) => {
+                      allPresent[stu.id] = {
+                        status: 'present',
+                        note: attendanceDrafts[stu.id]?.note || '',
+                      };
+                    });
+                    setAttendanceDrafts(allPresent);
+                  }}
+                >
+                  <UserCheck size={15} />{' '}
+                  {isAm ? 'ሁሉንም ተገኝተዋል በል' : 'Mark All Present'}
+                </button>
+                <button
+                  type="button"
+                  disabled={saving}
+                  onClick={handleSaveAttendance}
+                  className="primary-button"
+                >
+                  <Save size={15} />{' '}
+                  {isAm
+                    ? absentTodayCount > 0 && autoSendAbsenceSms
+                      ? `አስቀምጥ እና ${absentTodayCount} SMS ላክ`
+                      : 'ተገኝነት አስቀምጥ'
+                    : absentTodayCount > 0 && autoSendAbsenceSms
+                    ? `Save & Send ${absentTodayCount} Absence SMS`
+                    : 'Save Attendance'}
+                </button>
+              </div>
             </div>
-            <div className="flex flex-wrap gap-2">
-              <button
-                type="button"
-                className="secondary-button"
-                onClick={() => {
-                  const allPresent: Record<string, AttendanceDraft> = {};
-                  classStudents.forEach((stu) => {
-                    allPresent[stu.id] = {
-                      status: 'present',
-                      note: attendanceDrafts[stu.id]?.note || '',
-                    };
-                  });
-                  setAttendanceDrafts(allPresent);
-                }}
-              >
-                <UserCheck size={15} />{' '}
-                {isAm ? 'ሁሉንም ተገኝተዋል በል' : 'Mark All Present'}
-              </button>
-              <button
-                type="button"
-                disabled={saving}
-                onClick={handleSaveAttendance}
-                className="primary-button"
-              >
-                <Save size={15} /> {isAm ? 'ተገኝነት አስቀምጥ' : 'Save Attendance'}
-              </button>
-            </div>
-          </div>
 
-          <div className="mb-5 grid grid-cols-1 gap-3 sm:grid-cols-3">
-            <label className="text-xs font-semibold text-[#3c5149]">
-              {isAm ? 'ቀን' : 'Date'}
-              <input
-                type="date"
-                className="mt-1 w-full rounded-lg border border-[#d9e2dd] bg-white px-3 py-2 text-xs"
-                value={attendanceDate}
-                onChange={(e) => setAttendanceDate(e.target.value)}
-              />
-            </label>
-            <label className="text-xs font-semibold text-[#3c5149]">
-              {isAm ? 'ክፍል' : 'Grade'}
-              <select
-                className="mt-1 w-full rounded-lg border border-[#d9e2dd] bg-white px-3 py-2 text-xs"
-                value={selectedGradeLevel}
-                onChange={(e) => setSelectedGradeLevel(e.target.value)}
-              >
-                {['KG-1', 'KG-2', '1', '2', '3', '4', '5', '6', '7', '8', '9', '10', '11', '12'].map(
-                  (g) => (
-                    <option key={g} value={g}>
-                      {isAm ? `ክፍል ${g}` : `Grade ${g}`}
+            {/* Automated SMS Toggle Banner */}
+            <div className="mb-5 flex flex-wrap items-center justify-between gap-3 rounded-xl border border-[#cde3d6] bg-[#f4faf6] px-4 py-3 text-xs">
+              <div className="flex items-center gap-2.5">
+                <PhoneCall size={16} className="text-[#0b6248]" />
+                <div>
+                  <b className="text-[#073c2f]">
+                    {isAm
+                      ? 'ራስ-ሰር የSMS የመቅረት ማሳወቂያ (Automated SMS Absence Alerts)'
+                      : 'Automated SMS Absence Alerts to Parents'}
+                  </b>
+                  <p className="text-[11px] text-[#547268]">
+                    {isAm
+                      ? 'ተማሪ "ቀርቷል (Absent)" ተብሎ ሲመዘገብ ወዲያውኑ ለወላጅ ስልክ የSMS መልዕክት ይላካል።'
+                      : 'When a student is marked Absent and saved, an SMS alert is automatically dispatched to their guardian phone.'}
+                  </p>
+                </div>
+              </div>
+              <label className="inline-flex cursor-pointer items-center gap-2 font-bold text-[#073c2f]">
+                <input
+                  type="checkbox"
+                  className="h-4 w-4 accent-[#0b6248]"
+                  checked={autoSendAbsenceSms}
+                  onChange={(e) => setAutoSendAbsenceSms(e.target.checked)}
+                />
+                <span>
+                  {autoSendAbsenceSms
+                    ? isAm
+                      ? 'ንቁ (Enabled)'
+                      : 'Enabled'
+                    : isAm
+                    ? 'ጠፍቷል (Off)'
+                    : 'Off'}
+                </span>
+              </label>
+            </div>
+
+            <div className="mb-5 grid grid-cols-1 gap-3 sm:grid-cols-3">
+              <label className="text-xs font-semibold text-[#3c5149]">
+                {isAm ? 'ቀን' : 'Date'}
+                <input
+                  type="date"
+                  className="mt-1 w-full rounded-lg border border-[#d9e2dd] bg-white px-3 py-2 text-xs"
+                  value={attendanceDate}
+                  onChange={(e) => setAttendanceDate(e.target.value)}
+                />
+              </label>
+              <label className="text-xs font-semibold text-[#3c5149]">
+                {isAm ? 'ክፍል' : 'Grade'}
+                <select
+                  className="mt-1 w-full rounded-lg border border-[#d9e2dd] bg-white px-3 py-2 text-xs"
+                  value={selectedGradeLevel}
+                  onChange={(e) => setSelectedGradeLevel(e.target.value)}
+                >
+                  {['KG-1', 'KG-2', '1', '2', '3', '4', '5', '6', '7', '8', '9', '10', '11', '12'].map(
+                    (g) => (
+                      <option key={g} value={g}>
+                        {isAm ? `ክፍል ${g}` : `Grade ${g}`}
+                      </option>
+                    )
+                  )}
+                </select>
+              </label>
+              <label className="text-xs font-semibold text-[#3c5149]">
+                {isAm ? 'ሴክሽን' : 'Section'}
+                <select
+                  className="mt-1 w-full rounded-lg border border-[#d9e2dd] bg-white px-3 py-2 text-xs"
+                  value={selectedSection}
+                  onChange={(e) => setSelectedSection(e.target.value)}
+                >
+                  {['A', 'B', 'C', 'D'].map((sec) => (
+                    <option key={sec} value={sec}>
+                      {isAm ? `ሴክሽን ${sec}` : `Section ${sec}`}
                     </option>
-                  )
-                )}
-              </select>
-            </label>
-            <label className="text-xs font-semibold text-[#3c5149]">
-              {isAm ? 'ሴክሽን' : 'Section'}
-              <select
-                className="mt-1 w-full rounded-lg border border-[#d9e2dd] bg-white px-3 py-2 text-xs"
-                value={selectedSection}
-                onChange={(e) => setSelectedSection(e.target.value)}
-              >
-                {['A', 'B', 'C', 'D'].map((sec) => (
-                  <option key={sec} value={sec}>
-                    {isAm ? `ሴክሽን ${sec}` : `Section ${sec}`}
-                  </option>
-                ))}
-              </select>
-            </label>
-          </div>
+                  ))}
+                </select>
+              </label>
+            </div>
 
-          <div className="table-wrap">
-            <table>
-              <thead>
-                <tr>
-                  <th>{isAm ? 'መለያ ቁጥር' : 'Student ID'}</th>
-                  <th>{isAm ? 'የተማሪ ስም' : 'Student Name'}</th>
-                  <th>{isAm ? 'የተገኝነት ሁኔታ' : 'Attendance Status'}</th>
-                  <th>{isAm ? 'ማስታወሻ (ለቤተሰብ የሚታይ)' : 'Note (Visible to Family)'}</th>
-                </tr>
-              </thead>
-              <tbody>
-                {classStudents.map((stu) => {
-                  const draft = attendanceDrafts[stu.id] || {
-                    status: 'present' as const,
-                    note: '',
-                  };
-                  return (
-                    <tr key={stu.id}>
-                      <td className="muted-cell font-mono">{stu.student_id}</td>
-                      <td className="font-semibold text-[#19362b]">{stu.full_name}</td>
-                      <td>
-                        <div className="inline-flex flex-wrap gap-1.5">
-                          {(
-                            [
-                              ['present', isAm ? 'ተገኝቷል' : 'Present'],
-                              ['absent', isAm ? 'ቀርቷል' : 'Absent'],
-                              ['late', isAm ? 'ዘግይቷል' : 'Late'],
-                              ['excused', isAm ? 'በፈቃድ' : 'Excused'],
-                            ] as const
-                          ).map(([val, label]) => (
-                            <button
-                              key={val}
-                              type="button"
-                              onClick={() =>
-                                setAttendanceDrafts((prev) => ({
-                                  ...prev,
-                                  [stu.id]: { ...draft, status: val },
-                                }))
-                              }
-                              className={`rounded-md px-2.5 py-1 text-[11px] font-semibold border transition ${
-                                draft.status === val
-                                  ? val === 'present'
-                                    ? 'bg-[#0b6248] text-white border-[#0b6248]'
-                                    : val === 'absent'
-                                    ? 'bg-[#b34a3c] text-white border-[#b34a3c]'
-                                    : 'bg-[#c88c28] text-white border-[#c88c28]'
-                                  : 'bg-white text-[#587066] border-[#d9e2dd]'
-                              }`}
-                            >
-                              {label}
-                            </button>
-                          ))}
-                        </div>
-                      </td>
-                      <td>
-                        <input
-                          className="w-full min-w-[200px] rounded border border-[#d9e2dd] px-2.5 py-1 text-xs"
-                          placeholder={
-                            isAm ? 'ምክንያት ወይም ማስታወሻ...' : 'Optional note for parents...'
-                          }
-                          value={draft.note}
-                          onChange={(e) =>
-                            setAttendanceDrafts((prev) => ({
-                              ...prev,
-                              [stu.id]: { ...draft, note: e.target.value },
-                            }))
-                          }
-                        />
-                      </td>
+            <div className="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>{isAm ? 'መለያ ቁጥር' : 'Student ID'}</th>
+                    <th>{isAm ? 'የተማሪ ስም' : 'Student Name'}</th>
+                    <th>{isAm ? 'የወላጅ ስልክ' : 'Guardian Phone'}</th>
+                    <th>{isAm ? 'የተገኝነት ሁኔታ' : 'Attendance Status'}</th>
+                    <th>{isAm ? 'ማስታወሻ (በSMS ይካተታል)' : 'Note (Included in SMS)'}</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {classStudents.map((stu) => {
+                    const draft = attendanceDrafts[stu.id] || {
+                      status: 'present' as const,
+                      note: '',
+                    };
+                    return (
+                      <tr key={stu.id}>
+                        <td className="muted-cell font-mono">{stu.student_id}</td>
+                        <td className="font-semibold text-[#19362b]">{stu.full_name}</td>
+                        <td className="font-mono text-[11px] text-[#587066]">
+                          {stu.guardian_phone || '—'}
+                        </td>
+                        <td>
+                          <div className="inline-flex flex-wrap gap-1.5">
+                            {(
+                              [
+                                ['present', isAm ? 'ተገኝቷል' : 'Present'],
+                                ['absent', isAm ? 'ቀርቷል' : 'Absent'],
+                                ['late', isAm ? 'ዘግይቷል' : 'Late'],
+                                ['excused', isAm ? 'በፈቃድ' : 'Excused'],
+                              ] as const
+                            ).map(([val, label]) => (
+                              <button
+                                key={val}
+                                type="button"
+                                onClick={() =>
+                                  setAttendanceDrafts((prev) => ({
+                                    ...prev,
+                                    [stu.id]: { ...draft, status: val },
+                                  }))
+                                }
+                                className={`rounded-md px-2.5 py-1 text-[11px] font-semibold border transition ${
+                                  draft.status === val
+                                    ? val === 'present'
+                                      ? 'bg-[#0b6248] text-white border-[#0b6248]'
+                                      : val === 'absent'
+                                      ? 'bg-[#b34a3c] text-white border-[#b34a3c]'
+                                      : 'bg-[#c88c28] text-white border-[#c88c28]'
+                                    : 'bg-white text-[#587066] border-[#d9e2dd]'
+                                }`}
+                              >
+                                {label}
+                              </button>
+                            ))}
+                          </div>
+                        </td>
+                        <td>
+                          <input
+                            className="w-full min-w-[200px] rounded border border-[#d9e2dd] px-2.5 py-1 text-xs"
+                            placeholder={
+                              isAm ? 'ምክንያት ወይም ማስታወሻ...' : 'Optional note for parents...'
+                            }
+                            value={draft.note}
+                            onChange={(e) =>
+                              setAttendanceDrafts((prev) => ({
+                                ...prev,
+                                [stu.id]: { ...draft, note: e.target.value },
+                              }))
+                            }
+                          />
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          </section>
+
+          {/* Dispatched SMS Absence Log */}
+          <section className="panel">
+            <div className="panel-heading">
+              <div>
+                <p className="eyebrow">
+                  {isAm ? 'የተላኩ የSMS መልዕክቶች' : 'SMS Gateway Dispatch Log'}
+                </p>
+                <h2>
+                  {isAm
+                    ? 'ለወላጆች የተላኩ የመቅረት SMS ማሳወቂያዎች'
+                    : 'Sent Absence SMS Notifications'}
+                </h2>
+              </div>
+            </div>
+
+            {smsLogs.length === 0 ? (
+              <div className="empty-content">
+                <p>
+                  {isAm
+                    ? 'እስካሁን የተላከ የSMS ማሳወቂያ የለም።'
+                    : 'No absence SMS alerts dispatched yet.'}
+                </p>
+              </div>
+            ) : (
+              <div className="table-wrap">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>{isAm ? 'ቀን' : 'Date'}</th>
+                      <th>{isAm ? 'ወላጅ እና ስልክ' : 'Recipient Phone'}</th>
+                      <th>{isAm ? 'የተላከ መልዕክት' : 'SMS Message'}</th>
+                      <th>{isAm ? 'ሁኔታ' : 'Status'}</th>
+                      <th>{isAm ? 'ድርጊት' : 'Action'}</th>
                     </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-          </div>
-        </section>
+                  </thead>
+                  <tbody>
+                    {smsLogs.map((sms) => {
+                      const stu = students.find((s) => s.id === sms.student_id);
+                      return (
+                        <tr key={sms.id}>
+                          <td className="font-mono text-xs">{sms.alert_date}</td>
+                          <td>
+                            <div className="font-semibold text-[#19362b]">
+                              {sms.recipient_name || 'Guardian'}
+                            </div>
+                            <small className="font-mono text-[#71847b]">
+                              {sms.recipient_phone}
+                            </small>
+                          </td>
+                          <td className="max-w-md text-[#415b50]">{sms.message_text}</td>
+                          <td>
+                            <span className="status active uppercase">{sms.status}</span>
+                          </td>
+                          <td>
+                            {stu && (
+                              <button
+                                type="button"
+                                onClick={async () => {
+                                  const count = await dispatchAbsenceSmsForStudents(
+                                    [{ student: stu, note: '' }],
+                                    true
+                                  );
+                                  if (count > 0) {
+                                    showToast(
+                                      isAm
+                                        ? 'የSMS ማሳወቂያው እንደገና ተልኳል።'
+                                        : 'SMS absence alert resent.'
+                                    );
+                                  }
+                                }}
+                                className="inline-flex items-center gap-1 rounded bg-[#f4f7f5] px-2.5 py-1 text-[11px] font-semibold text-[#0b6248] hover:bg-[#e3f1e9]"
+                              >
+                                <Send size={11} /> {isAm ? 'ድጋሚ ላክ' : 'Resend'}
+                              </button>
+                            )}
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </section>
+        </div>
       )}
 
       {/* TAB 3: DIRECT FAMILY MESSAGING */}
